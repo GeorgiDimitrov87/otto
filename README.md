@@ -21,8 +21,9 @@ The source data has three characteristics that drive the design:
 - **Duplication.** `sales` contains repeated ingestions of the same logical sale. The natural key
   `(sku_id, order_id, orderdate_utc)` can appear many times, differing only by
   `insert_timestamp_utc`. We deduplicate with `ROW_NUMBER() OVER (PARTITION BY natural key ORDER BY
-  insert_timestamp_utc DESC)` and keep the latest ingestion per key. This collapses ~91,132
-  physical rows down to ~7,590 logical sales; skipping it would overstate revenue many times over.
+  insert_timestamp_utc DESC)` and keep the latest ingestion per key. This collapses 91,132
+  physical rows down to 2,530 logical sales (~36× duplication); skipping it would overstate
+  revenue by roughly 36×.
 - **Out-of-period noise.** `sales` spans late December 2024 through early February 2025. The
   pipeline restricts to the reporting period **2025-01-01 through 2025-01-31 inclusive**.
 - **Sparsity.** `sales` only holds products that sold. To produce a dense grid, the pipeline
