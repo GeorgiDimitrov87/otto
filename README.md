@@ -24,8 +24,20 @@ The source data has three characteristics that drive the design:
   insert_timestamp_utc DESC)` and keep the latest ingestion per key. This collapses 91,132
   physical rows down to 2,530 logical sales (~36× duplication); skipping it would overstate
   revenue by roughly 36×.
+
+  Two figures describe the deduplicated data, and they measure different things:
+
+  - `COUNT(*)` of deduped sales = **2,530** — how many distinct sales there are.
+  - `SUM(sales)` of deduped sales = **5,065** — how many units those sales moved.
+
+  The per-sale quantity is not always 1: the 2,530 sales split almost evenly into 844 sales of
+  1 unit, 837 of 2, and 849 of 3 (`1×844 + 2×837 + 3×849 = 5,065`), an average of ~2.0 units per
+  sale. The ~36× inflation is measured on `SUM(sales)` (deduped 5,065 vs raw 182,121), since
+  revenue is driven by quantity, not by the number of rows.
+
 - **Out-of-period noise.** `sales` spans late December 2024 through early February 2025. The
   pipeline restricts to the reporting period **2025-01-01 through 2025-01-31 inclusive**.
+  
 - **Sparsity.** `sales` only holds products that sold. To produce a dense grid, the pipeline
   `CROSS JOIN`s `product` against a 31-day January calendar (1000 SKUs × 31 days = 31,000 rows),
   `LEFT JOIN`s the deduplicated, in-period, per-day sales totals, and uses `COALESCE` to zero-fill
