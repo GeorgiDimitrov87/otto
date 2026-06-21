@@ -7,10 +7,10 @@ env:
 run: run-sql run-python
 
 run-sql:
-	PYTHONPATH=src .venv/bin/python -m revenue_pipeline.sql_runner
+	PYTHONPATH=src .venv/bin/python -m sql_runner
 
 run-python:
-	PYTHONPATH=src .venv/bin/python -m revenue_pipeline.build_revenue
+	PYTHONPATH=src .venv/bin/python -m run_python
 
 test:
 	PYTHONPATH=src .venv/bin/python -m pytest

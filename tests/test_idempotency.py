@@ -1,24 +1,18 @@
-"""Property-based test for SQL/Python equivalence (Property 6).
+"""Property-based test for idempotent execution of both revenue solutions.
 
-Covers a single design property from the revenue-pipeline design document:
+Covers Property 7 from the revenue-pipeline design document: running a solution
+more than once produces an identical revenue table on the five reporting columns
+(idempotent execution).
 
-  * Property 6 — the SQL_Solution (``sql/revenue.sql`` via ``run_sql_solution``)
-    and the Python_Solution (the CSV-sourced stdlib ETL driven by
-    ``run_python.main``) produce identical revenue tables on the five reporting
-    columns.
+This is a single parametrised test that exercises BOTH solutions:
 
-Idempotency (Property 7) lives in ``tests/test_idempotency.py`` — it is
-intentionally NOT in this file.
+  * SQL_Solution (``sql/revenue.sql`` via :func:`sql_runner.run_sql_solution`),
+    driven from ``product``/``sales`` TABLES seeded into a throwaway temp DB.
+  * Python_Solution (``run_python.main``: extract -> transform -> load), driven
+    from generated ``product.csv``/``sales.csv`` files into a fresh temp DB.
 
-Each example generates a fresh ``product``/``sales`` dataset and materialises it
-two ways so each solution can read its native input:
-
-  * a throwaway temp SQLite database (via the ``make_db`` fixture) holding the
-    ``product``/``sales`` source TABLES, which the SQL_Solution reads, and
-  * matching ``product.csv``/``sales.csv`` files (via the ``make_csvs`` fixture)
-    holding the SAME rows, which the Python_Solution reads.
-
-The generated data deliberately seeds:
+Each example generates a fresh ``product``/``sales`` dataset, deliberately
+seeding:
 
   * duplicate natural keys with varying ``insert_timestamp_utc`` (exercises dedup),
   * ``orderdate_utc`` values spanning Dec 2024 .. Feb 2025 (exercises the
@@ -36,8 +30,10 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from run_python import main as run_python_solution
+from run_python import main as run_python_main
 from sql_runner import run_sql_solution
+
+from tests.conftest import read_revenue_rows
 
 # --------------------------------------------------------------------------- #
 # Generators
@@ -95,45 +91,44 @@ def _datasets(draw):
 
 
 # --------------------------------------------------------------------------- #
-# Property 6
+# Property 7
 # --------------------------------------------------------------------------- #
 
-# Feature: revenue-pipeline, Property 6: SQL and Python solutions are equivalent
+# Feature: revenue-pipeline, Property 7: Idempotent execution
+@pytest.mark.parametrize("solution", ["sql", "python"])
 @settings(max_examples=100, deadline=None,
           suppress_health_check=[HealthCheck.function_scoped_fixture])
 @given(data=_datasets())
-def test_sql_and_python_solutions_are_equivalent(make_db, make_csvs, revenue_reader, data):
-    """SQL_Solution and Python_Solution agree on the reporting columns.
+def test_solution_is_idempotent(solution, make_db, make_csvs, data):
+    """Running a solution twice yields identical reporting columns.
 
-    **Validates: Requirements 2.11**
+    **Validates: Requirements 2.9**
 
-    The SQL_Solution reads the ``product``/``sales`` TABLES from a temp DB; the
-    Python_Solution reads matching ``product.csv``/``sales.csv`` files. Both
-    DROP and recreate ``revenue`` on the database they target, so we run the SQL
-    solution first against the DB and snapshot its revenue rows, then run the
-    Python solution writing into the SAME DB (it drops + recreates the table)
-    and snapshot again. The two snapshots must agree: exact equality on
-    ``sku_id``/``date_id``/``sales`` and ``abs=0.01`` tolerance on
-    ``price``/``revenue``.
+    For both solutions we run the build twice against the same target database
+    and assert the five reporting columns are byte-for-byte identical between
+    runs (the DROP-then-CREATE rebuild makes re-runs safe).
     """
     products, sales = data
-    db = make_db(products=products, sales=sales)
-    product_csv, sales_csv = make_csvs(products=products, sales=sales)
 
-    # --- SQL solution: reads product/sales TABLES from the temp DB --------
-    run_sql_solution(db_path=db)
-    sql_rows = revenue_reader(db)
+    if solution == "sql":
+        # SQL_Solution reads the product/sales TABLES from the DB itself.
+        db = make_db(products=products, sales=sales)
 
-    # --- Python solution: reads the matching CSVs, writes into the same DB -
-    run_python_solution(product_csv=product_csv, sales_csv=sales_csv, db_path=db)
-    python_rows = revenue_reader(db)
+        run_sql_solution(db_path=db)
+        first = read_revenue_rows(db)
 
-    assert len(sql_rows) == len(python_rows)
-    for sql_row, py_row in zip(sql_rows, python_rows):
-        sql_sku, sql_date, sql_price, sql_sales, sql_rev = sql_row
-        py_sku, py_date, py_price, py_sales, py_rev = py_row
-        assert sql_sku == py_sku
-        assert sql_date == py_date
-        assert sql_sales == py_sales
-        assert sql_price == pytest.approx(py_price, abs=0.01)
-        assert sql_rev == pytest.approx(py_rev, abs=0.01)
+        run_sql_solution(db_path=db)
+        second = read_revenue_rows(db)
+    else:
+        # Python_Solution reads the generated CSVs and writes into a fresh,
+        # empty target DB (seeded with no product/sales rows of its own).
+        product_csv, sales_csv = make_csvs(products=products, sales=sales)
+        db = make_db(products=[], sales=[])
+
+        run_python_main(product_csv, sales_csv, db)
+        first = read_revenue_rows(db)
+
+        run_python_main(product_csv, sales_csv, db)
+        second = read_revenue_rows(db)
+
+    assert first == second

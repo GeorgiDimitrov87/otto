@@ -2,10 +2,14 @@
 
 # Feature: revenue-pipeline, Property 5: Revenue equals price times sales, with price drawn from product
 
-For any Revenue_Table row, ``price`` equals the corresponding SKU's price from the
-``product`` table and ``revenue == price * sales``.
+For any output row produced by :func:`transform.transform`, ``price`` equals the
+corresponding SKU's price from the ``product`` source and ``revenue == price * sales``.
 
-**Validates: Requirements 6.2, 6.3**
+This test exercises the pure standard-library :func:`transform.transform` directly on
+in-memory ``product``/``sales`` dict lists — no database and no fixtures — so the
+multiplicative formula is observed straight from the returned revenue rows.
+
+Validates: Requirements 2.4
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import math
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from revenue_pipeline.build_revenue import build_revenue
+from transform import transform
 
 # January 2025 reporting period. Sales are generated within this window so that some
 # (SKU, day) cells are non-zero, exercising the multiplicative branch of the formula.
@@ -48,11 +52,16 @@ def _product_and_sales(draw):
     sku_ids = [sku_id for sku_id, _ in products]
 
     product_rows = [
-        (sku_id, f"sku-{sku_id}", price, "2024-12-01T00:00:00Z")
+        {
+            "sku_id": sku_id,
+            "sku_description": f"sku-{sku_id}",
+            "price": price,
+            "insert_timestamp_utc": "2024-12-01T00:00:00Z",
+        }
         for sku_id, price in products
     ]
 
-    sales_rows = draw(
+    sales_specs = draw(
         st.lists(
             st.tuples(
                 st.sampled_from(sku_ids),                    # sku_id
@@ -63,38 +72,46 @@ def _product_and_sales(draw):
             max_size=30,
         )
     )
-    sales_table = [
-        (sku_id, f"o{order_seed}", qty, day, "2025-01-15T00:00:00Z")
-        for sku_id, order_seed, qty, day in sales_rows
+    sales_rows = [
+        {
+            "sku_id": sku_id,
+            "order_id": f"o{order_seed}-{day}",
+            "sales": qty,
+            "orderdate_utc": day,
+            "insert_timestamp_utc": "2025-01-15T00:00:00Z",
+        }
+        for sku_id, order_seed, qty, day in sales_specs
     ]
 
-    return product_rows, sales_table
+    return product_rows, sales_rows
 
 
-@settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
 @given(data=_product_and_sales())
-def test_revenue_equals_price_times_sales(make_db, revenue_reader, data):
+def test_revenue_equals_price_times_sales(data):
     """price matches the SKU's product price and revenue == price * sales for every row."""
-    product_rows, sales_table = data
+    product_rows, sales_rows = data
 
-    # sku_id is emitted as TEXT in the output, so map by the textual form.
-    price_by_sku = {str(sku_id): price for sku_id, _desc, price, _ts in product_rows}
+    # sku_id is emitted as TEXT in the output, so map prices by the textual form.
+    price_by_sku = {str(row["sku_id"]): row["price"] for row in product_rows}
 
-    db = make_db(products=product_rows, sales=sales_table)
-    build_revenue(db_path=db)
+    rows = transform(product_rows, sales_rows)
+    assert rows, "expected the revenue output to contain rows"
 
-    rows = revenue_reader(db)
-    assert rows, "expected the revenue table to contain rows"
+    for row in rows:
+        sku_id = row["sku_id"]
+        price = row["price"]
+        sales = row["sales"]
+        revenue = row["revenue"]
 
-    for sku_id, _date_id, price, sales, revenue in rows:
-        # price is drawn from the corresponding product row (Req 6.2).
+        # price is drawn from the corresponding product row (Req 2.4).
         expected_price = price_by_sku[sku_id]
         assert math.isclose(price, expected_price, rel_tol=1e-9, abs_tol=1e-9), (
             f"price {price} != product price {expected_price} for sku {sku_id}"
         )
 
-        # revenue == price * sales (Req 6.3). Use the same arithmetic as the table,
-        # compared with a tolerance to absorb any float representation noise.
+        # revenue == price * sales (Req 2.4). Use the same arithmetic as the
+        # transform, compared with a tolerance to absorb any float representation noise.
         assert math.isclose(
             revenue, price * sales, rel_tol=1e-9, abs_tol=1e-9
         ), f"revenue {revenue} != price*sales {price * sales} for sku {sku_id}"
