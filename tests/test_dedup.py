@@ -2,14 +2,19 @@
 
 # Feature: revenue-pipeline, Property 1: Deduplication keeps one latest row per natural key
 
-Property 1 (design.md): For any generated ``sales`` table with arbitrary duplicate
+Property 1 (design.md): For any generated ``sales`` rows with arbitrary duplicate
 natural keys ``(sku_id, order_id, orderdate_utc)`` and arbitrary
 ``insert_timestamp_utc`` values, the deduplication step retains exactly one row per
 natural key — the row with the maximum ``insert_timestamp_utc``. Duplicates of the
 same natural key collapse to a single logical sale (they are NOT summed); distinct
 natural keys on the same (SKU, day) still sum together.
 
-Validates: Requirements 3.1, 3.2
+This test exercises the pure standard-library :func:`transform.transform` directly on
+in-memory ``product``/``sales`` dict lists — no database and no fixtures — so the
+deduplication behaviour is observed through the per-(SKU, day) ``sales`` cell of the
+returned revenue rows.
+
+Validates: Requirements 3.1, 3.2, 3.7
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from datetime import datetime, timedelta
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from revenue_pipeline.build_revenue import build_revenue
+from transform import transform
 
 # Base instant used to turn an integer ordinal into a fixed-width ISO-8601 string.
 # Fixed-width ISO timestamps sort lexically in chronological order, so the lexical
@@ -46,8 +51,8 @@ def dedup_scenarios(draw):
     ``sales`` quantities, so the dedup logic has something to collapse.
 
     Returns:
-        products: list of product rows for ``make_db``.
-        sales_rows: flattened list of sales rows (all duplicates included).
+        products: list of product dicts for :func:`transform`.
+        sales_rows: flattened list of sales dicts (all duplicates included).
         expected: dict mapping (sku_id_text, "YYYY-MM-DD") -> expected summed
             sales after dedup (sum of the max-timestamp quantity per natural key).
     """
@@ -59,7 +64,15 @@ def dedup_scenarios(draw):
                             allow_nan=False, allow_infinity=False))
         for sku in sku_ids
     }
-    products = [(sku, f"desc-{sku}", prices[sku], "2025-01-01T00:00:00") for sku in sku_ids]
+    products = [
+        {
+            "sku_id": sku,
+            "sku_description": f"desc-{sku}",
+            "price": prices[sku],
+            "insert_timestamp_utc": "2025-01-01T00:00:00",
+        }
+        for sku in sku_ids
+    ]
 
     # Distinct natural keys: (sku_id, order_id, day-of-january). `unique=True` on the
     # tuple guarantees each (sku, order_id, day) is a genuinely distinct natural key.
@@ -76,7 +89,7 @@ def dedup_scenarios(draw):
         )
     )
 
-    sales_rows: list[tuple] = []
+    sales_rows: list[dict] = []
     expected: dict[tuple[str, str], int] = {}
 
     for sku, order_id, day in keys:
@@ -93,7 +106,15 @@ def dedup_scenarios(draw):
 
         # Emit one physical sales row per duplicate ingestion of this natural key.
         for qty, ts in zip(quantities, ts_ordinals):
-            sales_rows.append((sku, order_id, qty, orderdate, _fmt_ts(ts)))
+            sales_rows.append(
+                {
+                    "sku_id": sku,
+                    "order_id": order_id,
+                    "sales": qty,
+                    "orderdate_utc": orderdate,
+                    "insert_timestamp_utc": _fmt_ts(ts),
+                }
+            )
 
         # The retained row is the one with the MAX insert timestamp; its quantity is
         # what should contribute to the (sku, day) cell.
@@ -106,9 +127,9 @@ def dedup_scenarios(draw):
     return products, sales_rows, expected
 
 
-@settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
 @given(dedup_scenarios())
-def test_dedup_keeps_one_latest_row_per_natural_key(make_db, revenue_reader, scenario):
+def test_dedup_keeps_one_latest_row_per_natural_key(scenario):
     """Each natural key collapses to its max-timestamp row before aggregation.
 
     The revenue cell for a (SKU, day) must equal the sum of the deduped (one per
@@ -116,13 +137,10 @@ def test_dedup_keeps_one_latest_row_per_natural_key(make_db, revenue_reader, sce
     """
     products, sales_rows, expected = scenario
 
-    db = make_db(products=products, sales=sales_rows)
-    build_revenue(db_path=db)
+    rows = transform(products, sales_rows)
 
-    rows = revenue_reader(db)
-
-    # Map the produced revenue table to per-cell sales for comparison.
-    produced = {(sku_id, date_id): sales for (sku_id, date_id, _price, sales, _rev) in rows}
+    # Map the produced revenue rows to per-cell sales for comparison.
+    produced = {(row["sku_id"], row["date_id"]): row["sales"] for row in rows}
 
     # Every cell that should carry deduped sales matches the expected deduped sum.
     for cell, expected_sales in expected.items():

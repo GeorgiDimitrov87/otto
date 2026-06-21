@@ -5,16 +5,28 @@ caller-provided ``product`` and ``sales`` rows. They NEVER touch the bundled
 ``fw/product_sales.db`` — every test (including the hypothesis-driven property
 tests) gets its own throwaway database file under pytest's ``tmp_path``.
 
-The module also puts the ``src/`` directory on ``sys.path`` so the package can
-be imported as ``revenue_pipeline.*`` without installation:
+The module also puts the flattened ``src/`` directory on ``sys.path`` so the
+pipeline modules can be imported directly (no package prefix, no installation):
 
-    from revenue_pipeline.config import DB_PATH, REVENUE_TABLE
-    from revenue_pipeline.sql_runner import run_sql_solution
-    from revenue_pipeline.build_revenue import build_revenue
+    from config import DB_PATH, REVENUE_TABLE
+    from extract import extract
+    from transform import transform
+    from load import write_revenue
+    from run_python import main
+    from sql_runner import run_sql_solution
+
+In addition to the DB-seeding helpers (``make_db`` / ``read_revenue_rows``) used
+by the SQL solution and the equivalence tests, this module provides a
+CSV-seeding helper (``write_csvs`` / the ``make_csvs`` fixture) that writes
+generated ``product``/``sales`` rows to temp ``product.csv``/``sales.csv`` files
+under ``tmp_path``. That lets the stdlib ETL path (extract → transform → load)
+be exercised end-to-end against a temp DB seeded from generated CSVs — still
+never touching the bundled ``fw/product_sales.db``.
 """
 
 from __future__ import annotations
 
+import csv
 import sqlite3
 import sys
 from pathlib import Path
@@ -23,8 +35,9 @@ from typing import Callable, Iterable, Sequence
 import pytest
 
 # --------------------------------------------------------------------------- #
-# Make the src/ layout importable: insert <repo>/src at the front of sys.path
-# so ``import revenue_pipeline`` resolves during test collection.
+# Make the flattened src/ layout importable: insert <repo>/src at the front of
+# sys.path so ``import config`` / ``import transform`` / etc. resolve directly
+# during test collection (the modules live at src/config.py, src/extract.py, …).
 # --------------------------------------------------------------------------- #
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
@@ -123,7 +136,7 @@ def make_db(tmp_path) -> Callable[..., Path]:
                 products=[(1, "widget", 9.99, "2025-01-01T00:00:00Z")],
                 sales=[(1, "o1", 3, "2025-01-05", "2025-01-05T10:00:00Z")],
             )
-            build_revenue(db_path=db)
+            run_sql_solution(db_path=db)
 
     Args:
         products: Iterable of product rows (see ``PRODUCT_COLUMNS``).
@@ -139,6 +152,97 @@ def make_db(tmp_path) -> Callable[..., Path]:
         counter["n"] += 1
         db_path = tmp_path / f"revenue_test_{counter['n']}.db"
         return _seed_database(db_path, products, sales)
+
+    return _factory
+
+
+# Source-CSV headers, matching the bundled fw/product.csv and fw/sales.csv.
+PRODUCT_CSV_HEADER = ("sku_id", "sku_description", "price", "insert_timestamp_utc")
+SALES_CSV_HEADER = (
+    "sku_id",
+    "order_id",
+    "sales",
+    "orderdate_utc",
+    "insert_timestamp_utc",
+)
+
+
+def write_csvs(dest_dir: Path,
+               products: Iterable[Sequence],
+               sales: Iterable[Sequence]) -> tuple[Path, Path]:
+    """Write ``products``/``sales`` rows to ``product.csv``/``sales.csv`` files.
+
+    Materialises the generated row lists as real CSV files under ``dest_dir``
+    (typically a test's ``tmp_path``) using the same headers as the bundled
+    Source_CSV files, so the stdlib ETL path can read them via
+    :func:`extract.extract`. The bundled ``fw/product.csv`` and ``fw/sales.csv``
+    are never touched.
+
+    Args:
+        dest_dir: Directory to write the two CSV files into (created if needed).
+        products: Iterable of ``(sku_id, sku_description, price,
+            insert_timestamp_utc)`` rows.
+        sales: Iterable of ``(sku_id, order_id, sales, orderdate_utc,
+            insert_timestamp_utc)`` rows.
+
+    Returns:
+        A ``(product_csv_path, sales_csv_path)`` tuple.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    product_csv = dest_dir / "product.csv"
+    sales_csv = dest_dir / "sales.csv"
+
+    with open(product_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(PRODUCT_CSV_HEADER)
+        writer.writerows(tuple(row) for row in products)
+
+    with open(sales_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(SALES_CSV_HEADER)
+        writer.writerows(tuple(row) for row in sales)
+
+    return product_csv, sales_csv
+
+
+@pytest.fixture
+def make_csvs(tmp_path) -> Callable[..., tuple[Path, Path]]:
+    """Factory fixture: write generated rows to temp ``product.csv``/``sales.csv``.
+
+    Returns a callable ``make_csvs(products, sales) -> (product_csv, sales_csv)``.
+    Each invocation writes a fresh pair of CSV files in its own subdirectory
+    under the test's ``tmp_path``, so the stdlib ETL path (extract → transform →
+    load) can be exercised end-to-end against a temp DB seeded from generated
+    CSVs. The bundled ``fw/product_sales.db`` and Source_CSV files are never
+    touched.
+
+    Example::
+
+        def test_etl(make_csvs, make_db):
+            product_csv, sales_csv = make_csvs(
+                products=[(1, "widget", 9.99, "2025-01-01T00:00:00Z")],
+                sales=[(1, "o1", 3, "2025-01-05", "2025-01-05T10:00:00Z")],
+            )
+            products, sales = extract(product_csv, sales_csv)
+            rows = transform(products, sales, PERIOD_START, PERIOD_END)
+            write_revenue(rows, db_path=make_db(products=[], sales=[]))
+
+    Args:
+        products: Iterable of product rows (see ``PRODUCT_CSV_HEADER``).
+        sales: Iterable of sales rows (see ``SALES_CSV_HEADER``). Defaults to empty.
+
+    Returns:
+        A ``(product_csv_path, sales_csv_path)`` tuple of freshly written files.
+    """
+    counter = {"n": 0}
+
+    def _factory(products: Iterable[Sequence],
+                 sales: Iterable[Sequence] = ()) -> tuple[Path, Path]:
+        counter["n"] += 1
+        dest_dir = tmp_path / f"csvs_{counter['n']}"
+        return write_csvs(dest_dir, products, sales)
 
     return _factory
 

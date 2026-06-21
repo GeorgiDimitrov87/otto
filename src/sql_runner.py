@@ -7,13 +7,13 @@ written. The SQL script is idempotent (``DROP TABLE IF EXISTS`` followed by
 
 Run as a module::
 
-    python -m revenue_pipeline.sql_runner
+    python -m sql_runner
 """
 
 import sqlite3
 from pathlib import Path
 
-from revenue_pipeline.config import DB_PATH, REVENUE_TABLE, SQL_PATH
+from config import DB_PATH, REVENUE_TABLE, SQL_PATH, SQLITE_TIMEOUT
 
 
 def run_sql_solution(db_path: Path = DB_PATH, sql_path: Path = SQL_PATH) -> int:
@@ -32,7 +32,7 @@ def run_sql_solution(db_path: Path = DB_PATH, sql_path: Path = SQL_PATH) -> int:
     """
     sql_text = Path(sql_path).read_text(encoding="utf-8")
 
-    connection = sqlite3.connect(db_path)
+    connection = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT)
     try:
         # executescript() implicitly issues a COMMIT before running, so begin a
         # fresh transaction explicitly to keep the build atomic and rollbackable.
